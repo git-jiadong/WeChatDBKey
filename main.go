@@ -2,10 +2,13 @@ package main
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha1"
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"unsafe"
@@ -181,63 +184,156 @@ func GetWeChatKey(info *WeChatInfo) string {
 	}
 
 	offset := 0
-	searchStr := []byte(info.AcountName)
+	// searchStr := []byte(info.AcountName)
 	for {
-		index := bytes.Index(buffer[offset:], searchStr)
+		index := hasDeviceSybmol(buffer[offset:])
 		if index == -1 {
+			fmt.Println("hasDeviceSybmolxxxx")
 			break
 		}
-		found := index + offset
-		// fmt.Printf("Found at index: 0x%X\n", found)
-		sybmolOffset := found + 0x50
-		if !info.Is64Bits {
-			sybmolOffset = found + 0x38
-		}
-		if hasDeviceSybmol(buffer[sybmolOffset : sybmolOffset+0x0F]) {
-			// fmt.Printf("hasDeviceSybmol: 0x%X\n", found)
-			keyIdx := found - 0x60
-			addrLen := 8
-			if !info.Is64Bits {
-				keyIdx = found - 0x3C
-				addrLen = 4
-			}
-			addrBuffer := make([]byte, 0x08)
-			copy(addrBuffer, buffer[keyIdx:keyIdx+addrLen])
+		fmt.Printf("hasDeviceSybmol: 0x%X\n", index)
+		keys := findDBKeyPtr(buffer[offset:index], info.Is64Bits)
+		// fmt.Println("keys:", keys)
 
-			var keyAddrPtr uint64
-			err = binary.Read(bytes.NewReader(addrBuffer), binary.LittleEndian, &keyAddrPtr)
-			if err != nil {
-				fmt.Println("binary.Read:", err)
-				return ""
-			}
-			fmt.Printf("keyAddrPtr: 0x%X\n", keyAddrPtr)
-			keyBuffer := make([]byte, 0x20)
-			err = windows.ReadProcessMemory(handle, uintptr(keyAddrPtr), &keyBuffer[0], uintptr(len(keyBuffer)), nil)
-			if err != nil {
-				fmt.Println("Error ReadProcessMemory:", err)
-				return ""
-			}
-			// fmt.Println("key: ", hex.EncodeToString(keyBuffer))
-
-			return hex.EncodeToString(keyBuffer)
+		key, err := findDBkey(handle, info.FilePath+"\\Msg\\Media.db", keys)
+		if err == nil {
+			// fmt.Println("key:", key)
+			return key
 		}
 
-		offset += index + len(searchStr)
+		offset += (index + 20)
 	}
 
 	return ""
 }
 
-func hasDeviceSybmol(buffer []byte) bool {
-	sybmols := [...]string{"android", "iphone", "ipad"}
-
+func hasDeviceSybmol(buffer []byte) int {
+	sybmols := [...][]byte{
+		{'a', 'n', 'd', 'r', 'o', 'i', 'd', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00},
+		{'i', 'p', 'h', 'o', 'n', 'e', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00},
+		{'i', 'p', 'a', 'd', 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00},
+	}
 	for _, syb := range sybmols {
-		if bytes.Contains(buffer, []byte(syb)) {
-			return true
+		if index := bytes.Index(buffer, syb); index != -1 {
+			return index
 		}
 	}
 
-	return false
+	return -1
+}
+
+func findDBKeyPtr(buffer []byte, is64Bits bool) [][]byte {
+	keys := make([][]byte, 0)
+	step := 8
+	keyLen := []byte{0x20, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
+	if !is64Bits {
+		keyLen = keyLen[:4]
+		step = 4
+	}
+
+	offset := len(buffer) - step
+	for {
+		if bytes.Contains(buffer[offset:offset+step], keyLen) {
+			keys = append(keys, buffer[offset-step:offset])
+		}
+
+		offset -= step
+		if offset <= 0 {
+			break
+		}
+	}
+
+	return keys
+}
+
+func findDBkey(handle windows.Handle, path string, keys [][]byte) (string, error) {
+	var keyAddrPtr uint64
+	addrBuffer := make([]byte, 0x08)
+	for _, key := range keys {
+		copy(addrBuffer, key)
+		err := binary.Read(bytes.NewReader(addrBuffer), binary.LittleEndian, &keyAddrPtr)
+		if err != nil {
+			fmt.Println("binary.Read:", err)
+			continue
+		}
+		if keyAddrPtr == 0x00 {
+			continue
+		}
+		fmt.Printf("keyAddrPtr: 0x%X\n", keyAddrPtr)
+		keyBuffer := make([]byte, 0x20)
+		err = windows.ReadProcessMemory(handle, uintptr(keyAddrPtr), &keyBuffer[0], uintptr(len(keyBuffer)), nil)
+		if err != nil {
+			// fmt.Println("Error ReadProcessMemory:", err)
+			continue
+		}
+		if checkDataBaseKey(path, keyBuffer) {
+			return hex.EncodeToString(keyBuffer), nil
+		}
+	}
+
+	return "", errors.New("not found key")
+}
+
+const (
+	keySize         = 32
+	defaultIter     = 64000
+	defaultPageSize = 4096
+)
+
+func checkDataBaseKey(path string, password []byte) bool {
+	// Read the encrypted file
+	blist, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+
+	salt := blist[:16]
+	key := pbkdf2HMAC(password, salt, defaultIter, keySize)
+
+	page1 := blist[16:defaultPageSize]
+
+	macSalt := xorBytes(salt, 0x3a)
+	macKey := pbkdf2HMAC(key, macSalt, 2, keySize)
+
+	hashMac := hmac.New(sha1.New, macKey)
+	hashMac.Write(page1[:len(page1)-32])
+	hashMac.Write([]byte{1, 0, 0, 0})
+
+	return hmac.Equal(hashMac.Sum(nil), page1[len(page1)-32:len(page1)-12])
+}
+
+func pbkdf2HMAC(password, salt []byte, iter, keyLen int) []byte {
+	dk := make([]byte, keyLen)
+	loop := (keyLen + sha1.Size - 1) / sha1.Size
+	key := make([]byte, 0, len(salt)+4)
+	u := make([]byte, sha1.Size)
+	for i := 1; i <= loop; i++ {
+		key = key[:0]
+		key = append(key, salt...)
+		key = append(key, byte(i>>24), byte(i>>16), byte(i>>8), byte(i))
+		hmac := hmac.New(sha1.New, password)
+		hmac.Write(key)
+		digest := hmac.Sum(nil)
+		copy(u, digest)
+		for j := 2; j <= iter; j++ {
+			hmac.Reset()
+			hmac.Write(digest)
+			digest = hmac.Sum(digest[:0])
+			for k, di := range digest {
+				u[k] ^= di
+			}
+		}
+		copy(dk[(i-1)*sha1.Size:], u)
+	}
+	return dk
+}
+
+func xorBytes(a []byte, b byte) []byte {
+	result := make([]byte, len(a))
+	for i := range a {
+		result[i] = a[i] ^ b
+	}
+	return result
 }
 
 func (info WeChatInfo) String() string {

@@ -5,6 +5,7 @@
 ## 介绍
 
 此项目可以无视Windows微信的版本可以直接获取微信数据库的密钥
+使用[WeChatDBDec](https://github.com/git-jiadong/WeChatDBDec)可以将数据库解密
 
 ## 使用方法
 
